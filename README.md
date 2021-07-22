@@ -151,6 +151,7 @@ Check out the **[contributing wiki](https://github.com/pion/webrtc/wiki/Contribu
 * [Alvaro Viebrantz](https://github.com/alvarowolfx)
 * [Kegan Dougal](https://github.com/Kegsay)
 * [Michael Zabka](https://github.com/misak113)
+* [Philippe Trottier](https://github.com/unity-ptrottier)
 
 ### License
 MIT License - see [LICENSE](LICENSE) for full text
