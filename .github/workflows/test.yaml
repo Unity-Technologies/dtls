@@ -3,9 +3,11 @@ on:
   push:
     branches:
     - master
+    - unity
   pull_request:
     branches:
     - master
+    - unity
 jobs:
   test:
     runs-on: ubuntu-latest
