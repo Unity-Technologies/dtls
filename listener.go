@@ -38,7 +38,7 @@ func Listen(network string, laddr *net.UDPAddr, config *Config) (net.Listener, e
 }
 
 // NewListener creates a DTLS listener which accepts connections from an inner Listener.
-func NewListener(inner net.Listener, config *Config) (net.Listener, error) {
+func NewListener(inner net.Listener, config *Config) (*listener, error) {
 	if err := validateConfig(config); err != nil {
 		return nil, err
 	}
@@ -65,6 +65,17 @@ func (l *listener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 	return Server(c, l.config)
+}
+
+// AcceptNoHandshake returns a connection that has not completed handshake
+// yet. Call Server on it to do so.
+func (l *listener) AcceptNoHandshake() (net.Conn, error) {
+	return l.parent.Accept()
+}
+
+// GetConfig returns the listener config. Intended for use with Server.
+func (l *listener) GetConfig() *Config {
+	return l.config
 }
 
 // Close closes the listener.
