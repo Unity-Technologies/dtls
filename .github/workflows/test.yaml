@@ -3,9 +3,11 @@ on:
   push:
     branches:
     - master
+    - unity
   pull_request:
     branches:
     - master
+    - unity
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -137,3 +139,4 @@ jobs:
           name: codecov-umbrella
           fail_ci_if_error: true
           flags: wasm
+           

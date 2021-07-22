@@ -38,7 +38,7 @@ func Listen(network string, laddr *net.UDPAddr, config *Config) (net.Listener, e
 }
 
 // NewListener creates a DTLS listener which accepts connections from an inner Listener.
-func NewListener(inner net.Listener, config *Config) (*listener, error) {
+func NewListener(inner net.Listener, config *Config) (*listener, error) { //nolint:golint
 	if err := validateConfig(config); err != nil {
 		return nil, err
 	}
