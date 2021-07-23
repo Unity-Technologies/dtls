@@ -95,7 +95,8 @@ func ListenNoHandshake(network string, laddr *net.UDPAddr, config *Config) (net.
 		listener{
 			config: config,
 			parent: parent,
-		}}, nil
+		},
+	}, nil
 }
 
 // noHandshakeListener represents a DTLS listener that does not automatically
