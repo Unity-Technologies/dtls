@@ -10,27 +10,11 @@ import (
 
 // Listen creates a DTLS listener
 func Listen(network string, laddr *net.UDPAddr, config *Config) (net.Listener, error) {
-	if err := validateConfig(config); err != nil {
-		return nil, err
-	}
-
-	lc := udp.ListenConfig{
-		AcceptFilter: func(packet []byte) bool {
-			pkts, err := recordlayer.UnpackDatagram(packet)
-			if err != nil || len(pkts) < 1 {
-				return false
-			}
-			h := &recordlayer.Header{}
-			if err := h.Unmarshal(pkts[0]); err != nil {
-				return false
-			}
-			return h.ContentType == protocol.ContentTypeHandshake
-		},
-	}
-	parent, err := lc.Listen(network, laddr)
+	parent, err := checkConfigAndListenUDP(network, laddr, config)
 	if err != nil {
 		return nil, err
 	}
+
 	return &listener{
 		config: config,
 		parent: parent,
@@ -38,7 +22,7 @@ func Listen(network string, laddr *net.UDPAddr, config *Config) (net.Listener, e
 }
 
 // NewListener creates a DTLS listener which accepts connections from an inner Listener.
-func NewListener(inner net.Listener, config *Config) (*listener, error) { //nolint:golint
+func NewListener(inner net.Listener, config *Config) (net.Listener, error) {
 	if err := validateConfig(config); err != nil {
 		return nil, err
 	}
@@ -67,17 +51,6 @@ func (l *listener) Accept() (net.Conn, error) {
 	return Server(c, l.config)
 }
 
-// AcceptNoHandshake returns a connection that has not completed handshake
-// yet. Call Server on it to do so.
-func (l *listener) AcceptNoHandshake() (net.Conn, error) {
-	return l.parent.Accept()
-}
-
-// GetConfig returns the listener config. Intended for use with Server.
-func (l *listener) GetConfig() *Config {
-	return l.config
-}
-
 // Close closes the listener.
 // Any blocked Accept operations will be unblocked and return errors.
 // Already Accepted connections are not closed.
@@ -88,4 +61,52 @@ func (l *listener) Close() error {
 // Addr returns the listener's network address.
 func (l *listener) Addr() net.Addr {
 	return l.parent.Addr()
+}
+
+func checkConfigAndListenUDP(network string, laddr *net.UDPAddr, config *Config) (net.Listener, error) {
+	if err := validateConfig(config); err != nil {
+		return nil, err
+	}
+
+	lc := udp.ListenConfig{
+		AcceptFilter: func(packet []byte) bool {
+			pkts, err := recordlayer.UnpackDatagram(packet)
+			if err != nil || len(pkts) < 1 {
+				return false
+			}
+			h := &recordlayer.Header{}
+			if err := h.Unmarshal(pkts[0]); err != nil {
+				return false
+			}
+			return h.ContentType == protocol.ContentTypeHandshake
+		},
+	}
+	return lc.Listen(network, laddr)
+}
+
+// ListenNoHandshake creates a DTLS listener which does not automatically handshake on Accept.
+func ListenNoHandshake(network string, laddr *net.UDPAddr, config *Config) (net.Listener, error) {
+	parent, err := checkConfigAndListenUDP(network, laddr, config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &noHandshakeListener{
+		listener{
+			config: config,
+			parent: parent,
+		}}, nil
+}
+
+// noHandshakeListener represents a DTLS listener that does not automatically
+// handshake on Accept.
+type noHandshakeListener struct {
+	listener
+}
+
+// Accept waits for and returns the next connection to the listener.
+// Connection handshake does not occur during accept and needs to be manually
+// called by passed the returned net.Conn to the Server function.
+func (n *noHandshakeListener) Accept() (net.Conn, error) {
+	return n.parent.Accept()
 }
