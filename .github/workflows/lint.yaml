@@ -16,9 +16,6 @@ jobs:
           with:
             fetch-depth: 0
 
-        - name: Commit Message
-          run: .github/lint-commit-message.sh
-
         - name: File names
           run: .github/lint-filename.sh
 
