@@ -107,7 +107,7 @@ type noHandshakeListener struct {
 
 // Accept waits for and returns the next connection to the listener.
 // Connection handshake does not occur during accept and needs to be manually
-// called by passed the returned net.Conn to the Server function.
+// called by passing the returned net.Conn to the Server function.
 func (n *noHandshakeListener) Accept() (net.Conn, error) {
 	return n.parent.Accept()
 }
