@@ -938,7 +938,9 @@ func (c *Conn) close(byUser bool) error {
 	}
 
 	c.closeLock.Lock()
-	close(c.writeToNextConn)
+	if !c.isConnectionClosed() {
+		close(c.writeToNextConn)
+	}
 	// Don't return ErrConnClosed at the first time of the call from user.
 	closedByUser := c.connectionClosedByUser
 	if byUser {
