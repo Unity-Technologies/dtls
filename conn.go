@@ -228,6 +228,7 @@ func (c *Conn) writerLoop() {
 		for _, compactedRawPacket := range task.compactedRawPackets {
 			_, err := c.nextConn.WriteContext(task.ctx, compactedRawPacket)
 			task.result <- netError(err)
+			break // stop task on first error
 		}
 	}
 }
