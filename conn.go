@@ -41,13 +41,20 @@ func invalidKeyingLabels() map[string]bool {
 	}
 }
 
+type writeTask struct {
+	ctx                 context.Context
+	compactedRawPackets [][]byte
+	result              chan error
+}
+
 // Conn represents a DTLS connection
 type Conn struct {
-	lock           sync.RWMutex     // Internal lock (must not be public)
-	nextConn       connctx.ConnCtx  // Embedded Conn, typically a udpconn we read/write from
-	fragmentBuffer *fragmentBuffer  // out-of-order and missing fragment handling
-	handshakeCache *handshakeCache  // caching of handshake messages for verifyData generation
-	decrypted      chan interface{} // Decrypted Application Data or error, pull by calling `Read`
+	writeToNextConn chan writeTask
+	lock            sync.RWMutex     // Internal lock (must not be public)
+	nextConn        connctx.ConnCtx  // Embedded Conn, typically a udpconn we read/write from
+	fragmentBuffer  *fragmentBuffer  // out-of-order and missing fragment handling
+	handshakeCache  *handshakeCache  // caching of handshake messages for verifyData generation
+	decrypted       chan interface{} // Decrypted Application Data or error, pull by calling `Read`
 
 	state State // Internal state
 
@@ -58,9 +65,10 @@ type Conn struct {
 	encryptedPackets [][]byte
 
 	connectionClosedByUser bool
-	closeLock              sync.Mutex
+	closeLock              sync.RWMutex
 	closed                 *closer.Closer
 	handshakeLoopsFinished sync.WaitGroup
+	writerFinished         sync.WaitGroup
 
 	readDeadline  *deadline.Deadline
 	writeDeadline *deadline.Deadline
@@ -125,8 +133,9 @@ func createConn(ctx context.Context, nextConn net.Conn, config *Config, isClient
 		handshakeCache:          newHandshakeCache(),
 		maximumTransmissionUnit: mtu,
 
-		decrypted: make(chan interface{}, 1),
-		log:       logger,
+		writeToNextConn: make(chan writeTask, 8),
+		decrypted:       make(chan interface{}, 1),
+		log:             logger,
 
 		readDeadline:  deadline.New(),
 		writeDeadline: deadline.New(),
@@ -142,6 +151,17 @@ func createConn(ctx context.Context, nextConn net.Conn, config *Config, isClient
 			isClient: isClient,
 		},
 	}
+
+	c.writerFinished.Add(1)
+	go func() {
+		defer c.writerFinished.Done()
+		for task := range c.writeToNextConn {
+			for _, compactedRawPacket := range task.compactedRawPackets {
+				_, err := c.nextConn.WriteContext(task.ctx, compactedRawPacket)
+				task.result <- netError(err)
+			}
+		}
+	}()
 
 	c.setRemoteEpoch(0)
 	c.setLocalEpoch(0)
@@ -340,6 +360,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 func (c *Conn) Close() error {
 	err := c.close(true)
 	c.handshakeLoopsFinished.Wait()
+	c.writerFinished.Wait()
 	return err
 }
 
@@ -365,7 +386,6 @@ func (c *Conn) SelectedSRTPProtectionProfile() (SRTPProtectionProfile, bool) {
 
 func (c *Conn) writePackets(ctx context.Context, pkts []*packet) error {
 	c.lock.Lock()
-	defer c.lock.Unlock()
 
 	var rawPackets [][]byte
 
@@ -373,6 +393,7 @@ func (c *Conn) writePackets(ctx context.Context, pkts []*packet) error {
 		if h, ok := p.record.Content.(*handshake.Handshake); ok {
 			handshakeRaw, err := p.record.Marshal()
 			if err != nil {
+				c.lock.Unlock()
 				return err
 			}
 
@@ -383,29 +404,33 @@ func (c *Conn) writePackets(ctx context.Context, pkts []*packet) error {
 
 			rawHandshakePackets, err := c.processHandshakePacket(p, h)
 			if err != nil {
+				c.lock.Unlock()
 				return err
 			}
 			rawPackets = append(rawPackets, rawHandshakePackets...)
 		} else {
 			rawPacket, err := c.processPacket(p)
 			if err != nil {
+				c.lock.Unlock()
 				return err
 			}
 			rawPackets = append(rawPackets, rawPacket)
 		}
 	}
 	if len(rawPackets) == 0 {
+		c.lock.Unlock()
 		return nil
 	}
 	compactedRawPackets := c.compactRawPackets(rawPackets)
 
-	for _, compactedRawPackets := range compactedRawPackets {
-		if _, err := c.nextConn.WriteContext(ctx, compactedRawPackets); err != nil {
-			return netError(err)
-		}
+	result := make(chan error, 1)
+	c.closeLock.RLock()
+	if !c.isConnectionClosed() {
+		c.writeToNextConn <- writeTask{ctx, compactedRawPackets, result}
 	}
-
-	return nil
+	c.closeLock.RUnlock()
+	c.lock.Unlock() // unlock before waiting on the result of the writeTask.
+	return <-result
 }
 
 func (c *Conn) compactRawPackets(rawPackets [][]byte) [][]byte {
@@ -906,6 +931,7 @@ func (c *Conn) close(byUser bool) error {
 	}
 
 	c.closeLock.Lock()
+	close(c.writeToNextConn)
 	// Don't return ErrConnClosed at the first time of the call from user.
 	closedByUser := c.connectionClosedByUser
 	if byUser {

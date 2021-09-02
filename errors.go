@@ -120,6 +120,8 @@ func (e *errAlert) Is(err error) bool {
 // netError translates an error from underlying Conn to corresponding net.Error.
 func netError(err error) error {
 	switch err {
+  case nil:
+    return nil
 	case io.EOF, context.Canceled, context.DeadlineExceeded:
 		// Return io.EOF and context errors as is.
 		return err
