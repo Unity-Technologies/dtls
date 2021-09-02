@@ -224,12 +224,16 @@ func createConn(ctx context.Context, nextConn net.Conn, config *Config, isClient
 
 func (c *Conn) writerLoop() {
 	defer c.writerFinished.Done()
+nextTask:
 	for task := range c.writeToNextConn {
 		for _, compactedRawPacket := range task.compactedRawPackets {
 			_, err := c.nextConn.WriteContext(task.ctx, compactedRawPacket)
-			task.result <- netError(err)
-			break // stop task on first error
+			if err != nil {
+				task.result <- netError(err)
+				continue nextTask // stop task on first error
+			}
 		}
+		task.result <- nil
 	}
 }
 
