@@ -432,7 +432,9 @@ func (c *Conn) writePackets(ctx context.Context, pkts []*packet) error {
 
 	result := make(chan error, 1)
 	c.closeLock.RLock()
-	if !c.isConnectionClosed() {
+	if c.isConnectionClosed() {
+		result <- ErrConnClosed
+	} else {
 		c.writeToNextConn <- writeTask{ctx, compactedRawPackets, result}
 	}
 	c.closeLock.RUnlock()
