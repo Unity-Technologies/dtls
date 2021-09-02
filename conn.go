@@ -153,15 +153,7 @@ func createConn(ctx context.Context, nextConn net.Conn, config *Config, isClient
 	}
 
 	c.writerFinished.Add(1)
-	go func() {
-		defer c.writerFinished.Done()
-		for task := range c.writeToNextConn {
-			for _, compactedRawPacket := range task.compactedRawPackets {
-				_, err := c.nextConn.WriteContext(task.ctx, compactedRawPacket)
-				task.result <- netError(err)
-			}
-		}
-	}()
+	go c.writerLoop()
 
 	c.setRemoteEpoch(0)
 	c.setLocalEpoch(0)
@@ -228,6 +220,16 @@ func createConn(ctx context.Context, nextConn net.Conn, config *Config, isClient
 	c.log.Trace("Handshake Completed")
 
 	return c, nil
+}
+
+func (c *Conn) writerLoop() {
+	defer c.writerFinished.Done()
+	for task := range c.writeToNextConn {
+		for _, compactedRawPacket := range task.compactedRawPackets {
+			_, err := c.nextConn.WriteContext(task.ctx, compactedRawPacket)
+			task.result <- netError(err)
+		}
+	}
 }
 
 // Dial connects to the given network address and establishes a DTLS connection on top.
