@@ -69,6 +69,7 @@ type Conn struct {
 	closed                 *closer.Closer
 	handshakeLoopsFinished sync.WaitGroup
 	writerFinished         sync.WaitGroup
+	writingOK              bool
 
 	readDeadline  *deadline.Deadline
 	writeDeadline *deadline.Deadline
@@ -139,6 +140,7 @@ func createConn(ctx context.Context, nextConn net.Conn, config *Config, isClient
 
 		readDeadline:  deadline.New(),
 		writeDeadline: deadline.New(),
+		writingOK:     true,
 
 		reading:          make(chan struct{}, 1),
 		handshakeRecv:    make(chan chan struct{}),
@@ -214,12 +216,23 @@ func createConn(ctx context.Context, nextConn net.Conn, config *Config, isClient
 	}
 	// Do handshake
 	if err := c.handshake(ctx, hsCfg, initialFlight, initialFSMState); err != nil {
+		c.endWriterLoop()
 		return nil, err
 	}
 
 	c.log.Trace("Handshake Completed")
 
 	return c, nil
+}
+
+func (c *Conn) endWriterLoop() {
+	c.closeLock.Lock()
+	if c.writingOK {
+		close(c.writeToNextConn)
+	}
+	c.writingOK = false
+	c.closeLock.Unlock()
+	c.writerFinished.Wait()
 }
 
 func (c *Conn) writerLoop() {
@@ -432,7 +445,7 @@ func (c *Conn) writePackets(ctx context.Context, pkts []*packet) error {
 
 	result := make(chan error, 1)
 	c.closeLock.RLock()
-	if c.isConnectionClosed() {
+	if !c.writingOK {
 		result <- ErrConnClosed
 	} else {
 		c.writeToNextConn <- writeTask{ctx, compactedRawPackets, result}
@@ -940,9 +953,10 @@ func (c *Conn) close(byUser bool) error {
 	}
 
 	c.closeLock.Lock()
-	if !c.isConnectionClosed() {
+	if c.writingOK {
 		close(c.writeToNextConn)
 	}
+	c.writingOK = false
 	// Don't return ErrConnClosed at the first time of the call from user.
 	closedByUser := c.connectionClosedByUser
 	if byUser {
