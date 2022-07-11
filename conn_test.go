@@ -3,9 +3,14 @@ package dtls
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	cryptoElliptic "crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -115,6 +120,8 @@ func TestReadWriteDeadline(t *testing.T) {
 	report := test.CheckRoutines(t)
 	defer report()
 
+	var e net.Error
+
 	ca, cb, err := pipeMemory()
 	if err != nil {
 		t.Fatal(err)
@@ -124,22 +131,22 @@ func TestReadWriteDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, werr := ca.Write(make([]byte, 100))
-	if e, ok := werr.(net.Error); ok {
+	if errors.As(werr, &e) {
 		if !e.Timeout() {
 			t.Error("Deadline exceeded Write must return Timeout error")
 		}
-		if !e.Temporary() {
+		if !e.Temporary() { //nolint:staticcheck
 			t.Error("Deadline exceeded Write must return Temporary error")
 		}
 	} else {
 		t.Error("Write must return net.Error error")
 	}
 	_, rerr := ca.Read(make([]byte, 100))
-	if e, ok := rerr.(net.Error); ok {
+	if errors.As(rerr, &e) {
 		if !e.Timeout() {
 			t.Error("Deadline exceeded Read must return Timeout error")
 		}
-		if !e.Temporary() {
+		if !e.Temporary() { //nolint:staticcheck
 			t.Error("Deadline exceeded Read must return Temporary error")
 		}
 	} else {
@@ -295,6 +302,35 @@ func testServer(ctx context.Context, c net.Conn, cfg *Config, generateCertificat
 	return ServerWithContext(ctx, c, cfg)
 }
 
+func sendClientHello(cookie []byte, ca net.Conn, sequenceNumber uint64, extensions []extension.Extension) error {
+	packet, err := (&recordlayer.RecordLayer{
+		Header: recordlayer.Header{
+			Version:        protocol.Version1_2,
+			SequenceNumber: sequenceNumber,
+		},
+		Content: &handshake.Handshake{
+			Header: handshake.Header{
+				MessageSequence: uint16(sequenceNumber),
+			},
+			Message: &handshake.MessageClientHello{
+				Version:            protocol.Version1_2,
+				Cookie:             cookie,
+				CipherSuiteIDs:     cipherSuiteIDs(defaultCipherSuites()),
+				CompressionMethods: defaultCompressionMethods(),
+				Extensions:         extensions,
+			},
+		},
+	}).Marshal()
+	if err != nil {
+		return err
+	}
+
+	if _, err = ca.Write(packet); err != nil {
+		return err
+	}
+	return nil
+}
+
 func TestHandshakeWithAlert(t *testing.T) {
 	// Limit runtime in case of deadlocks
 	lim := test.TimeOut(time.Second * 20)
@@ -319,7 +355,7 @@ func TestHandshakeWithAlert(t *testing.T) {
 				CipherSuites: []CipherSuiteID{TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
 			},
 			errServer: errCipherSuiteNoIntersection,
-			errClient: &errAlert{&alert.Alert{Level: alert.Fatal, Description: alert.InsufficientSecurity}},
+			errClient: &alertError{&alert.Alert{Level: alert.Fatal, Description: alert.InsufficientSecurity}},
 		},
 		"SignatureSchemesNoIntersection": {
 			configServer: &Config{
@@ -330,7 +366,7 @@ func TestHandshakeWithAlert(t *testing.T) {
 				CipherSuites:     []CipherSuiteID{TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
 				SignatureSchemes: []tls.SignatureScheme{tls.ECDSAWithP521AndSHA512},
 			},
-			errServer: &errAlert{&alert.Alert{Level: alert.Fatal, Description: alert.InsufficientSecurity}},
+			errServer: &alertError{&alert.Alert{Level: alert.Fatal, Description: alert.InsufficientSecurity}},
 			errClient: errNoAvailableSignatureSchemes,
 		},
 	}
@@ -449,6 +485,11 @@ func TestPSK(t *testing.T) {
 			ServerIdentity: nil,
 			CipherSuites:   []CipherSuiteID{TLS_PSK_WITH_AES_128_CBC_SHA256},
 		},
+		{
+			Name:           "TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256",
+			ServerIdentity: nil,
+			CipherSuites:   []CipherSuiteID{TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256},
+		},
 	} {
 		test := test
 		t.Run(test.Name, func(t *testing.T) {
@@ -466,8 +507,8 @@ func TestPSK(t *testing.T) {
 			go func() {
 				conf := &Config{
 					PSK: func(hint []byte) ([]byte, error) {
-						if !bytes.Equal(test.ServerIdentity, hint) { // nolint
-							return nil, fmt.Errorf("TestPSK: Client got invalid identity expected(% 02x) actual(% 02x)", test.ServerIdentity, hint) // nolint
+						if !bytes.Equal(test.ServerIdentity, hint) {
+							return nil, fmt.Errorf("TestPSK: Client got invalid identity expected(% 02x) actual(% 02x)", test.ServerIdentity, hint) //nolint:goerr113
 						}
 
 						return []byte{0xAB, 0xC1, 0x23}, nil
@@ -519,7 +560,7 @@ func TestPSKHintFail(t *testing.T) {
 	report := test.CheckRoutines(t)
 	defer report()
 
-	serverAlertError := &errAlert{&alert.Alert{Level: alert.Fatal, Description: alert.InternalError}}
+	serverAlertError := &alertError{&alert.Alert{Level: alert.Fatal, Description: alert.InternalError}}
 	pskRejected := errPSKRejected
 
 	// Limit runtime in case of deadlocks
@@ -581,14 +622,15 @@ func TestClientTimeout(t *testing.T) {
 
 		c, err := testClient(ctx, ca, conf, true)
 		if err == nil {
-			_ = c.Close()
+			_ = c.Close() //nolint:contextcheck
 		}
 		clientErr <- err
 	}()
 
 	// no server!
 	err := <-clientErr
-	if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
 		t.Fatalf("Client error exp(Temporary network error) failed(%v)", err)
 	}
 }
@@ -627,7 +669,7 @@ func TestSRTPConfiguration(t *testing.T) {
 			ClientSRTP:      []SRTPProtectionProfile{SRTP_AES128_CM_HMAC_SHA1_80},
 			ServerSRTP:      nil,
 			ExpectedProfile: 0,
-			WantClientError: &errAlert{&alert.Alert{Level: alert.Fatal, Description: alert.InsufficientSecurity}},
+			WantClientError: &alertError{&alert.Alert{Level: alert.Fatal, Description: alert.InsufficientSecurity}},
 			WantServerError: errServerNoMatchingSRTPProfile,
 		},
 		{
@@ -819,8 +861,6 @@ func TestClientCertificate(t *testing.T) {
 		for name, tt := range tests {
 			tt := tt
 			t.Run(name, func(t *testing.T) {
-				t.Parallel()
-
 				ca, cb := dpipe.Pipe()
 				type result struct {
 					c   *Conn
@@ -957,7 +997,7 @@ func TestExtendedMasterSecret(t *testing.T) {
 				ExtendedMasterSecret: DisableExtendedMasterSecret,
 			},
 			expectedClientErr: errClientRequiredButNoServerEMS,
-			expectedServerErr: &errAlert{&alert.Alert{Level: alert.Fatal, Description: alert.InsufficientSecurity}},
+			expectedServerErr: &alertError{&alert.Alert{Level: alert.Fatal, Description: alert.InsufficientSecurity}},
 		},
 		"Disable_Request_ExtendedMasterSecret": {
 			clientCfg: &Config{
@@ -976,7 +1016,7 @@ func TestExtendedMasterSecret(t *testing.T) {
 			serverCfg: &Config{
 				ExtendedMasterSecret: RequireExtendedMasterSecret,
 			},
-			expectedClientErr: &errAlert{&alert.Alert{Level: alert.Fatal, Description: alert.InsufficientSecurity}},
+			expectedClientErr: &alertError{&alert.Alert{Level: alert.Fatal, Description: alert.InsufficientSecurity}},
 			expectedServerErr: errServerRequiredButNoClientEMS,
 		},
 		"Disable_Disable_ExtendedMasterSecret": {
@@ -1106,8 +1146,6 @@ func TestServerCertificate(t *testing.T) {
 		for name, tt := range tests {
 			tt := tt
 			t.Run(name, func(t *testing.T) {
-				t.Parallel()
-
 				ca, cb := dpipe.Pipe()
 
 				type result struct {
@@ -1164,8 +1202,8 @@ func TestCipherSuiteConfiguration(t *testing.T) {
 			Name:               "Invalid CipherSuite",
 			ClientCipherSuites: []CipherSuiteID{0x00},
 			ServerCipherSuites: []CipherSuiteID{0x00},
-			WantClientError:    &invalidCipherSuite{0x00},
-			WantServerError:    &invalidCipherSuite{0x00},
+			WantClientError:    &invalidCipherSuiteError{0x00},
+			WantServerError:    &invalidCipherSuiteError{0x00},
 		},
 		{
 			Name:                    "Valid CipherSuites specified",
@@ -1179,7 +1217,7 @@ func TestCipherSuiteConfiguration(t *testing.T) {
 			Name:               "CipherSuites mismatch",
 			ClientCipherSuites: []CipherSuiteID{TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
 			ServerCipherSuites: []CipherSuiteID{TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA},
-			WantClientError:    &errAlert{&alert.Alert{Level: alert.Fatal, Description: alert.InsufficientSecurity}},
+			WantClientError:    &alertError{&alert.Alert{Level: alert.Fatal, Description: alert.InsufficientSecurity}},
 			WantServerError:    errCipherSuiteNoIntersection,
 		},
 		{
@@ -1525,7 +1563,8 @@ func TestServerTimeout(t *testing.T) {
 	}
 
 	_, serverErr := testServer(ctx, cb, config, true)
-	if netErr, ok := serverErr.(net.Error); !ok || !netErr.Timeout() {
+	var netErr net.Error
+	if !errors.As(serverErr, &netErr) || !netErr.Timeout() {
 		t.Fatalf("Client error exp(Temporary network error) failed(%v)", serverErr)
 	}
 
@@ -1554,11 +1593,6 @@ func TestProtocolVersionValidation(t *testing.T) {
 
 	var rand [28]byte
 	random := handshake.Random{GMTUnixTime: time.Unix(500, 0), RandomBytes: rand}
-
-	localKeypair, err := elliptic.GenerateKeypair(elliptic.X25519)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	config := &Config{
 		CipherSuites:   []CipherSuiteID{TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
@@ -1711,49 +1745,6 @@ func TestProtocolVersionValidation(t *testing.T) {
 							},
 						},
 					},
-					{
-						Header: recordlayer.Header{
-							Version:        protocol.Version1_2,
-							SequenceNumber: 2,
-						},
-						Content: &handshake.Handshake{
-							Header: handshake.Header{
-								MessageSequence: 2,
-							},
-							Message: &handshake.MessageCertificate{},
-						},
-					},
-					{
-						Header: recordlayer.Header{
-							Version:        protocol.Version1_2,
-							SequenceNumber: 3,
-						},
-						Content: &handshake.Handshake{
-							Header: handshake.Header{
-								MessageSequence: 3,
-							},
-							Message: &handshake.MessageServerKeyExchange{
-								EllipticCurveType:  elliptic.CurveTypeNamedCurve,
-								NamedCurve:         elliptic.X25519,
-								PublicKey:          localKeypair.PublicKey,
-								HashAlgorithm:      hash.SHA256,
-								SignatureAlgorithm: signature.ECDSA,
-								Signature:          make([]byte, 64),
-							},
-						},
-					},
-					{
-						Header: recordlayer.Header{
-							Version:        protocol.Version1_2,
-							SequenceNumber: 4,
-						},
-						Content: &handshake.Handshake{
-							Header: handshake.Header{
-								MessageSequence: 4,
-							},
-							Message: &handshake.MessageServerHelloDone{},
-						},
-					},
 				},
 			},
 		}
@@ -1888,7 +1879,11 @@ func TestMultipleHelloVerifyRequest(t *testing.T) {
 		if err := record.Unmarshal(resp[:n]); err != nil {
 			t.Fatal(err)
 		}
-		clientHello := record.Content.(*handshake.Handshake).Message.(*handshake.MessageClientHello)
+		clientHello, ok := record.Content.(*handshake.Handshake).Message.(*handshake.MessageClientHello)
+		if !ok {
+			t.Fatal("Failed to cast MessageClientHello")
+		}
+
 		if !bytes.Equal(clientHello.Cookie, cookie) {
 			t.Fatalf("Wrong cookie, expected: %x, got: %x", clientHello.Cookie, cookie)
 		}
@@ -1931,41 +1926,6 @@ func TestRenegotationInfo(t *testing.T) {
 	} {
 		test := testCase
 		t.Run(test.Name, func(t *testing.T) {
-			sendClientHello := func(cookie []byte, ca net.Conn, sequenceNumber uint64) {
-				extensions := []extension.Extension{}
-				if test.SendRenegotiationInfo {
-					extensions = append(extensions, &extension.RenegotiationInfo{
-						RenegotiatedConnection: 0,
-					})
-				}
-
-				packet, err := (&recordlayer.RecordLayer{
-					Header: recordlayer.Header{
-						Version:        protocol.Version1_2,
-						SequenceNumber: sequenceNumber,
-					},
-					Content: &handshake.Handshake{
-						Header: handshake.Header{
-							MessageSequence: uint16(sequenceNumber),
-						},
-						Message: &handshake.MessageClientHello{
-							Version:            protocol.Version1_2,
-							Cookie:             cookie,
-							CipherSuiteIDs:     cipherSuiteIDs(defaultCipherSuites()),
-							CompressionMethods: defaultCompressionMethods(),
-							Extensions:         extensions,
-						},
-					},
-				}).Marshal()
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				if _, err = ca.Write(packet); err != nil {
-					t.Fatal(err)
-				}
-			}
-
 			ca, cb := dpipe.Pipe()
 			defer func() {
 				if err := ca.Close(); err != nil {
@@ -1984,7 +1944,16 @@ func TestRenegotationInfo(t *testing.T) {
 
 			time.Sleep(50 * time.Millisecond)
 
-			sendClientHello([]byte{}, ca, 0)
+			extensions := []extension.Extension{}
+			if test.SendRenegotiationInfo {
+				extensions = append(extensions, &extension.RenegotiationInfo{
+					RenegotiatedConnection: 0,
+				})
+			}
+			err := sendClientHello([]byte{}, ca, 0, extensions)
+			if err != nil {
+				t.Fatal(err)
+			}
 			n, err := ca.Read(resp)
 			if err != nil {
 				t.Fatal(err)
@@ -1994,9 +1963,15 @@ func TestRenegotationInfo(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			helloVerifyRequest := r.Content.(*handshake.Handshake).Message.(*handshake.MessageHelloVerifyRequest)
+			helloVerifyRequest, ok := r.Content.(*handshake.Handshake).Message.(*handshake.MessageHelloVerifyRequest)
+			if !ok {
+				t.Fatal("Failed to cast MessageHelloVerifyRequest")
+			}
 
-			sendClientHello(helloVerifyRequest.Cookie, ca, 1)
+			err = sendClientHello(helloVerifyRequest.Cookie, ca, 1, extensions)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if n, err = ca.Read(resp); err != nil {
 				t.Fatal(err)
 			}
@@ -2010,7 +1985,11 @@ func TestRenegotationInfo(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			serverHello := r.Content.(*handshake.Handshake).Message.(*handshake.MessageServerHello)
+			serverHello, ok := r.Content.(*handshake.Handshake).Message.(*handshake.MessageServerHello)
+			if !ok {
+				t.Fatal("Failed to cast MessageServerHello")
+			}
+
 			gotNegotationInfo := false
 			for _, v := range serverHello.Extensions {
 				if _, ok := v.(*extension.RenegotiationInfo); ok {
@@ -2020,6 +1999,727 @@ func TestRenegotationInfo(t *testing.T) {
 
 			if !gotNegotationInfo {
 				t.Fatalf("Received ServerHello without RenegotiationInfo")
+			}
+		})
+	}
+}
+
+func TestServerNameIndicationExtension(t *testing.T) {
+	// Limit runtime in case of deadlocks
+	lim := test.TimeOut(time.Second * 20)
+	defer lim.Stop()
+
+	// Check for leaking routines
+	report := test.CheckRoutines(t)
+	defer report()
+
+	for _, test := range []struct {
+		Name       string
+		ServerName string
+		Expected   []byte
+		IncludeSNI bool
+	}{
+		{
+			Name:       "Server name is a valid hostname",
+			ServerName: "example.com",
+			Expected:   []byte("example.com"),
+			IncludeSNI: true,
+		},
+		{
+			Name:       "Server name is an IP literal",
+			ServerName: "1.2.3.4",
+			Expected:   []byte(""),
+			IncludeSNI: false,
+		},
+		{
+			Name:       "Server name is empty",
+			ServerName: "",
+			Expected:   []byte(""),
+			IncludeSNI: false,
+		},
+	} {
+		test := test
+		t.Run(test.Name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			ca, cb := dpipe.Pipe()
+			go func() {
+				conf := &Config{
+					ServerName: test.ServerName,
+				}
+
+				_, _ = testClient(ctx, ca, conf, false)
+			}()
+
+			// Receive ClientHello
+			resp := make([]byte, 1024)
+			n, err := cb.Read(resp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := &recordlayer.RecordLayer{}
+			if err = r.Unmarshal(resp[:n]); err != nil {
+				t.Fatal(err)
+			}
+
+			clientHello, ok := r.Content.(*handshake.Handshake).Message.(*handshake.MessageClientHello)
+			if !ok {
+				t.Fatal("Failed to cast MessageClientHello")
+			}
+
+			gotSNI := false
+			var actualServerName string
+			for _, v := range clientHello.Extensions {
+				if _, ok := v.(*extension.ServerName); ok {
+					gotSNI = true
+					extensionServerName, ok := v.(*extension.ServerName)
+					if !ok {
+						t.Fatal("Failed to cast extension.ServerName")
+					}
+
+					actualServerName = extensionServerName.ServerName
+				}
+			}
+
+			if gotSNI != test.IncludeSNI {
+				t.Errorf("TestSNI: unexpected SNI inclusion '%s': expected(%v) actual(%v)", test.Name, test.IncludeSNI, gotSNI)
+			}
+
+			if !bytes.Equal([]byte(actualServerName), test.Expected) {
+				t.Errorf("TestSNI: server name mismatch '%s': expected(%v) actual(%v)", test.Name, test.Expected, actualServerName)
+			}
+		})
+	}
+}
+
+func TestALPNExtension(t *testing.T) {
+	// Limit runtime in case of deadlocks
+	lim := test.TimeOut(time.Second * 20)
+	defer lim.Stop()
+
+	// Check for leaking routines
+	report := test.CheckRoutines(t)
+	defer report()
+
+	for _, test := range []struct {
+		Name                   string
+		ClientProtocolNameList []string
+		ServerProtocolNameList []string
+		ExpectedProtocol       string
+		ExpectAlertFromClient  bool
+		ExpectAlertFromServer  bool
+		Alert                  alert.Description
+	}{
+		{
+			Name:                   "Negotiate a protocol",
+			ClientProtocolNameList: []string{"http/1.1", "spd/1"},
+			ServerProtocolNameList: []string{"spd/1"},
+			ExpectedProtocol:       "spd/1",
+			ExpectAlertFromClient:  false,
+			ExpectAlertFromServer:  false,
+			Alert:                  0,
+		},
+		{
+			Name:                   "Server doesn't support any",
+			ClientProtocolNameList: []string{"http/1.1", "spd/1"},
+			ServerProtocolNameList: []string{},
+			ExpectedProtocol:       "",
+			ExpectAlertFromClient:  false,
+			ExpectAlertFromServer:  false,
+			Alert:                  0,
+		},
+		{
+			Name:                   "Negotiate with higher server precedence",
+			ClientProtocolNameList: []string{"http/1.1", "spd/1", "http/3"},
+			ServerProtocolNameList: []string{"ssh/2", "http/3", "spd/1"},
+			ExpectedProtocol:       "http/3",
+			ExpectAlertFromClient:  false,
+			ExpectAlertFromServer:  false,
+			Alert:                  0,
+		},
+		{
+			Name:                   "Empty intersection",
+			ClientProtocolNameList: []string{"http/1.1", "http/3"},
+			ServerProtocolNameList: []string{"ssh/2", "spd/1"},
+			ExpectedProtocol:       "",
+			ExpectAlertFromClient:  false,
+			ExpectAlertFromServer:  true,
+			Alert:                  alert.NoApplicationProtocol,
+		},
+		{
+			Name:                   "Multiple protocols in ServerHello",
+			ClientProtocolNameList: []string{"http/1.1"},
+			ServerProtocolNameList: []string{"http/1.1"},
+			ExpectedProtocol:       "http/1.1",
+			ExpectAlertFromClient:  true,
+			ExpectAlertFromServer:  false,
+			Alert:                  alert.InternalError,
+		},
+	} {
+		test := test
+		t.Run(test.Name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			ca, cb := dpipe.Pipe()
+			go func() {
+				conf := &Config{
+					SupportedProtocols: test.ClientProtocolNameList,
+				}
+				_, _ = testClient(ctx, ca, conf, false)
+			}()
+
+			// Receive ClientHello
+			resp := make([]byte, 1024)
+			n, err := cb.Read(resp)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel2()
+
+			ca2, cb2 := dpipe.Pipe()
+			go func() {
+				conf := &Config{
+					SupportedProtocols: test.ServerProtocolNameList,
+				}
+				if _, err2 := testServer(ctx2, cb2, conf, true); !errors.Is(err2, context.Canceled) {
+					if test.ExpectAlertFromServer {
+						// Assert the error type?
+					} else {
+						t.Error(err2)
+					}
+				}
+			}()
+
+			time.Sleep(50 * time.Millisecond)
+
+			// Forward ClientHello
+			if _, err = ca2.Write(resp[:n]); err != nil {
+				t.Fatal(err)
+			}
+
+			// Receive HelloVerify
+			resp2 := make([]byte, 1024)
+			n, err = ca2.Read(resp2)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Forward HelloVerify
+			if _, err = cb.Write(resp2[:n]); err != nil {
+				t.Fatal(err)
+			}
+
+			// Receive ClientHello
+			resp3 := make([]byte, 1024)
+			n, err = cb.Read(resp3)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Forward ClientHello
+			if _, err = ca2.Write(resp3[:n]); err != nil {
+				t.Fatal(err)
+			}
+
+			// Receive ServerHello
+			resp4 := make([]byte, 1024)
+			n, err = ca2.Read(resp4)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			messages, err := recordlayer.UnpackDatagram(resp4[:n])
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			r := &recordlayer.RecordLayer{}
+			if err := r.Unmarshal(messages[0]); err != nil {
+				t.Fatal(err)
+			}
+
+			if test.ExpectAlertFromServer {
+				a, ok := r.Content.(*alert.Alert)
+				if !ok {
+					t.Fatal("Failed to cast alert.Alert")
+				}
+
+				if a.Description != test.Alert {
+					t.Errorf("ALPN %v: expected(%v) actual(%v)", test.Name, test.Alert, a.Description)
+				}
+			} else {
+				serverHello, ok := r.Content.(*handshake.Handshake).Message.(*handshake.MessageServerHello)
+				if !ok {
+					t.Fatal("Failed to cast handshake.MessageServerHello")
+				}
+
+				var negotiatedProtocol string
+				for _, v := range serverHello.Extensions {
+					if _, ok := v.(*extension.ALPN); ok {
+						e, ok := v.(*extension.ALPN)
+						if !ok {
+							t.Fatal("Failed to cast extension.ALPN")
+						}
+
+						negotiatedProtocol = e.ProtocolNameList[0]
+
+						// Manipulate ServerHello
+						if test.ExpectAlertFromClient {
+							e.ProtocolNameList = append(e.ProtocolNameList, "oops")
+						}
+					}
+				}
+
+				if negotiatedProtocol != test.ExpectedProtocol {
+					t.Errorf("ALPN %v: expected(%v) actual(%v)", test.Name, test.ExpectedProtocol, negotiatedProtocol)
+				}
+
+				s, err := r.Marshal()
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				// Forward ServerHello
+				if _, err = cb.Write(s); err != nil {
+					t.Fatal(err)
+				}
+
+				if test.ExpectAlertFromClient {
+					resp5 := make([]byte, 1024)
+					n, err = cb.Read(resp5)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					r2 := &recordlayer.RecordLayer{}
+					if err := r2.Unmarshal(resp5[:n]); err != nil {
+						t.Fatal(err)
+					}
+
+					a, ok := r2.Content.(*alert.Alert)
+					if !ok {
+						t.Fatal("Failed to cast alert.Alert")
+					}
+
+					if a.Description != test.Alert {
+						t.Errorf("ALPN %v: expected(%v) actual(%v)", test.Name, test.Alert, a.Description)
+					}
+				}
+			}
+
+			time.Sleep(50 * time.Millisecond) // Give some time for returned errors
+		})
+	}
+}
+
+// Make sure the supported_groups extension is not included in the ServerHello
+func TestSupportedGroupsExtension(t *testing.T) {
+	// Limit runtime in case of deadlocks
+	lim := test.TimeOut(time.Second * 20)
+	defer lim.Stop()
+
+	// Check for leaking routines
+	report := test.CheckRoutines(t)
+	defer report()
+
+	t.Run("ServerHello Supported Groups", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		ca, cb := dpipe.Pipe()
+		go func() {
+			if _, err := testServer(ctx, cb, &Config{}, true); !errors.Is(err, context.Canceled) {
+				t.Error(err)
+			}
+		}()
+		extensions := []extension.Extension{
+			&extension.SupportedEllipticCurves{
+				EllipticCurves: []elliptic.Curve{elliptic.X25519, elliptic.P256, elliptic.P384},
+			},
+			&extension.SupportedPointFormats{
+				PointFormats: []elliptic.CurvePointFormat{elliptic.CurvePointFormatUncompressed},
+			},
+		}
+
+		time.Sleep(50 * time.Millisecond)
+
+		resp := make([]byte, 1024)
+		err := sendClientHello([]byte{}, ca, 0, extensions)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Receive ServerHello
+		n, err := ca.Read(resp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := &recordlayer.RecordLayer{}
+		if err = r.Unmarshal(resp[:n]); err != nil {
+			t.Fatal(err)
+		}
+
+		helloVerifyRequest, ok := r.Content.(*handshake.Handshake).Message.(*handshake.MessageHelloVerifyRequest)
+		if !ok {
+			t.Fatal("Failed to cast MessageHelloVerifyRequest")
+		}
+
+		err = sendClientHello(helloVerifyRequest.Cookie, ca, 1, extensions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n, err = ca.Read(resp); err != nil {
+			t.Fatal(err)
+		}
+
+		messages, err := recordlayer.UnpackDatagram(resp[:n])
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := r.Unmarshal(messages[0]); err != nil {
+			t.Fatal(err)
+		}
+
+		serverHello, ok := r.Content.(*handshake.Handshake).Message.(*handshake.MessageServerHello)
+		if !ok {
+			t.Fatal("Failed to cast MessageServerHello")
+		}
+
+		gotGroups := false
+		for _, v := range serverHello.Extensions {
+			if _, ok := v.(*extension.SupportedEllipticCurves); ok {
+				gotGroups = true
+			}
+		}
+
+		if gotGroups {
+			t.Errorf("TestSupportedGroups: supported_groups extension was sent in ServerHello")
+		}
+	})
+}
+
+func TestSessionResume(t *testing.T) {
+	// Limit runtime in case of deadlocks
+	lim := test.TimeOut(time.Second * 20)
+	defer lim.Stop()
+
+	// Check for leaking routines
+	report := test.CheckRoutines(t)
+	defer report()
+
+	t.Run("resumed", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		type result struct {
+			c   *Conn
+			err error
+		}
+		clientRes := make(chan result, 1)
+
+		ss := &memSessStore{}
+
+		id, _ := hex.DecodeString("9b9fc92255634d9fb109febed42166717bb8ded8c738ba71bc7f2a0d9dae0306")
+		secret, _ := hex.DecodeString("2e942a37aca5241deb2295b5fcedac221c7078d2503d2b62aeb48c880d7da73c001238b708559686b9da6e829c05ead7")
+
+		s := Session{ID: id, Secret: secret}
+
+		ca, cb := dpipe.Pipe()
+
+		_ = ss.Set(id, s)
+		_ = ss.Set([]byte(ca.RemoteAddr().String()+"_example.com"), s)
+
+		go func() {
+			config := &Config{
+				CipherSuites: []CipherSuiteID{TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+				ServerName:   "example.com",
+				SessionStore: ss,
+				MTU:          100,
+			}
+			c, err := testClient(ctx, ca, config, false)
+			clientRes <- result{c, err}
+		}()
+
+		config := &Config{
+			CipherSuites: []CipherSuiteID{TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+			ServerName:   "example.com",
+			SessionStore: ss,
+			MTU:          100,
+		}
+		server, err := testServer(ctx, cb, config, true)
+		if err != nil {
+			t.Fatalf("TestSessionResume: Server failed(%v)", err)
+		}
+
+		actualSessionID := server.ConnectionState().SessionID
+		actualMasterSecret := server.ConnectionState().masterSecret
+		if !bytes.Equal(actualSessionID, id) {
+			t.Errorf("TestSessionResumetion: SessionID Mismatch: expected(%v) actual(%v)", id, actualSessionID)
+		}
+		if !bytes.Equal(actualMasterSecret, secret) {
+			t.Errorf("TestSessionResumetion: masterSecret Mismatch: expected(%v) actual(%v)", secret, actualMasterSecret)
+		}
+
+		defer func() {
+			_ = server.Close()
+		}()
+
+		res := <-clientRes
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		_ = res.c.Close()
+	})
+
+	t.Run("new session", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		type result struct {
+			c   *Conn
+			err error
+		}
+		clientRes := make(chan result, 1)
+
+		s1 := &memSessStore{}
+		s2 := &memSessStore{}
+
+		ca, cb := dpipe.Pipe()
+		go func() {
+			config := &Config{
+				ServerName:   "example.com",
+				SessionStore: s1,
+			}
+			c, err := testClient(ctx, ca, config, false)
+			clientRes <- result{c, err}
+		}()
+
+		config := &Config{
+			SessionStore: s2,
+		}
+		server, err := testServer(ctx, cb, config, true)
+		if err != nil {
+			t.Fatalf("TestSessionResumetion: Server failed(%v)", err)
+		}
+
+		actualSessionID := server.ConnectionState().SessionID
+		actualMasterSecret := server.ConnectionState().masterSecret
+		ss, _ := s2.Get(actualSessionID)
+		if !bytes.Equal(actualMasterSecret, ss.Secret) {
+			t.Errorf("TestSessionResumetion: masterSecret Mismatch: expected(%v) actual(%v)", ss.Secret, actualMasterSecret)
+		}
+
+		defer func() {
+			_ = server.Close()
+		}()
+
+		res := <-clientRes
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		cs, _ := s1.Get([]byte(ca.RemoteAddr().String() + "_example.com"))
+		if !bytes.Equal(actualMasterSecret, cs.Secret) {
+			t.Errorf("TestSessionResumetion: masterSecret Mismatch: expected(%v) actual(%v)", ss.Secret, actualMasterSecret)
+		}
+		_ = res.c.Close()
+	})
+}
+
+type memSessStore struct {
+	sync.Map
+}
+
+func (ms *memSessStore) Set(key []byte, s Session) error {
+	k := hex.EncodeToString(key)
+	ms.Store(k, s)
+
+	return nil
+}
+
+func (ms *memSessStore) Get(key []byte) (Session, error) {
+	k := hex.EncodeToString(key)
+
+	v, ok := ms.Load(k)
+	if !ok {
+		return Session{}, nil
+	}
+
+	s, ok := v.(Session)
+	if !ok {
+		return Session{}, nil
+	}
+
+	return s, nil
+}
+
+func (ms *memSessStore) Del(key []byte) error {
+	k := hex.EncodeToString(key)
+	ms.Delete(k)
+
+	return nil
+}
+
+// Assert that the server only uses CipherSuites with a hash+signature that matches
+// the certificate. As specified in rfc5246#section-7.4.3
+func TestCipherSuiteMatchesCertificateType(t *testing.T) {
+	// Limit runtime in case of deadlocks
+	lim := test.TimeOut(time.Second * 20)
+	defer lim.Stop()
+
+	// Check for leaking routines
+	report := test.CheckRoutines(t)
+	defer report()
+
+	for _, test := range []struct {
+		Name           string
+		cipherList     []CipherSuiteID
+		expectedCipher CipherSuiteID
+		generateRSA    bool
+	}{
+		{
+			Name:           "ECDSA Certificate with RSA CipherSuite first",
+			cipherList:     []CipherSuiteID{TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+			expectedCipher: TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		},
+		{
+			Name:           "RSA Certificate with ECDSA CipherSuite first",
+			cipherList:     []CipherSuiteID{TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
+			expectedCipher: TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			generateRSA:    true,
+		},
+	} {
+		test := test
+		t.Run(test.Name, func(t *testing.T) {
+			clientErr := make(chan error, 1)
+			client := make(chan *Conn, 1)
+
+			ca, cb := dpipe.Pipe()
+			go func() {
+				c, err := testClient(context.TODO(), ca, &Config{CipherSuites: test.cipherList}, false)
+				clientErr <- err
+				client <- c
+			}()
+
+			var (
+				priv crypto.PrivateKey
+				err  error
+			)
+
+			if test.generateRSA {
+				if priv, err = rsa.GenerateKey(rand.Reader, 2048); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if priv, err = ecdsa.GenerateKey(cryptoElliptic.P256(), rand.Reader); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			serverCert, err := selfsign.SelfSign(priv)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if s, err := testServer(context.TODO(), cb, &Config{
+				CipherSuites: test.cipherList,
+				Certificates: []tls.Certificate{serverCert},
+			}, false); err != nil {
+				t.Fatal(err)
+			} else if err = s.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			if c, err := <-client, <-clientErr; err != nil {
+				t.Fatal(err)
+			} else if err := c.Close(); err != nil {
+				t.Fatal(err)
+			} else if c.ConnectionState().cipherSuite.ID() != test.expectedCipher {
+				t.Fatalf("Expected(%s) and Actual(%s) CipherSuite do not match", test.expectedCipher, c.ConnectionState().cipherSuite.ID())
+			}
+		})
+	}
+}
+
+// Test that we return the proper certificate if we are serving multiple ServerNames on a single Server
+func TestMultipleServerCertificates(t *testing.T) {
+	fooCert, err := selfsign.GenerateSelfSignedWithDNS("foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	barCert, err := selfsign.GenerateSelfSignedWithDNS("bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	caPool := x509.NewCertPool()
+	for _, cert := range []tls.Certificate{fooCert, barCert} {
+		certificate, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		caPool.AddCert(certificate)
+	}
+
+	for _, test := range []struct {
+		RequestServerName string
+		ExpectedDNSName   string
+	}{
+		{
+			"foo",
+			"foo",
+		},
+		{
+			"bar",
+			"bar",
+		},
+		{
+			"invalid",
+			"foo",
+		},
+	} {
+		test := test
+		t.Run(test.RequestServerName, func(t *testing.T) {
+			clientErr := make(chan error, 2)
+			client := make(chan *Conn, 1)
+
+			ca, cb := dpipe.Pipe()
+			go func() {
+				c, err := testClient(context.TODO(), ca, &Config{
+					RootCAs:    caPool,
+					ServerName: test.RequestServerName,
+					VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+						certificate, err := x509.ParseCertificate(rawCerts[0])
+						if err != nil {
+							return err
+						}
+
+						if certificate.DNSNames[0] != test.ExpectedDNSName {
+							return errWrongCert
+						}
+
+						return nil
+					},
+				}, false)
+				clientErr <- err
+				client <- c
+			}()
+
+			if s, err := testServer(context.TODO(), cb, &Config{Certificates: []tls.Certificate{fooCert, barCert}}, false); err != nil {
+				t.Fatal(err)
+			} else if err = s.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			if c, err := <-client, <-clientErr; err != nil {
+				t.Fatal(err)
+			} else if err := c.Close(); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
