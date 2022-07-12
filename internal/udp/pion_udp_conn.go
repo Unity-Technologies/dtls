@@ -1,4 +1,5 @@
 // Package udp provides a connection-oriented listener over a UDP PacketConn
+// copied from https://github.com/pion/udp/blob/master/conn.go
 package udp
 
 import (
