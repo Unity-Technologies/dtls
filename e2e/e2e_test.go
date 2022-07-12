@@ -1,9 +1,13 @@
+//go:build !js
 // +build !js
 
 package e2e
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -226,6 +230,7 @@ func testPionE2ESimple(t *testing.T, server, client func(*comm)) {
 
 	for _, cipherSuite := range []dtls.CipherSuiteID{
 		dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		dtls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 		dtls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
 	} {
 		cipherSuite := cipherSuite
@@ -260,7 +265,9 @@ func testPionE2ESimplePSK(t *testing.T, server, client func(*comm)) {
 	for _, cipherSuite := range []dtls.CipherSuiteID{
 		dtls.TLS_PSK_WITH_AES_128_CCM,
 		dtls.TLS_PSK_WITH_AES_128_CCM_8,
+		dtls.TLS_PSK_WITH_AES_256_CCM_8,
 		dtls.TLS_PSK_WITH_AES_128_GCM_SHA256,
+		dtls.TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256,
 	} {
 		cipherSuite := cipherSuite
 		t.Run(cipherSuite.String(), func(t *testing.T) {
@@ -316,6 +323,167 @@ func testPionE2EMTUs(t *testing.T, server, client func(*comm)) {
 	}
 }
 
+func testPionE2ESimpleED25519(t *testing.T, server, client func(*comm)) {
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	for _, cipherSuite := range []dtls.CipherSuiteID{
+		dtls.TLS_ECDHE_ECDSA_WITH_AES_128_CCM,
+		dtls.TLS_ECDHE_ECDSA_WITH_AES_128_CCM_8,
+		dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		dtls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		dtls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+	} {
+		cipherSuite := cipherSuite
+		t.Run(cipherSuite.String(), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			_, key, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cert, err := selfsign.SelfSign(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			cfg := &dtls.Config{
+				Certificates:       []tls.Certificate{cert},
+				CipherSuites:       []dtls.CipherSuiteID{cipherSuite},
+				InsecureSkipVerify: true,
+			}
+			serverPort := randomPort(t)
+			comm := newComm(ctx, cfg, cfg, serverPort, server, client)
+			comm.assert(t)
+		})
+	}
+}
+
+func testPionE2ESimpleED25519ClientCert(t *testing.T, server, client func(*comm)) {
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, skey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scert, err := selfsign.SelfSign(skey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, ckey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ccert, err := selfsign.SelfSign(ckey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scfg := &dtls.Config{
+		Certificates: []tls.Certificate{scert},
+		CipherSuites: []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+		ClientAuth:   dtls.RequireAnyClientCert,
+	}
+	ccfg := &dtls.Config{
+		Certificates:       []tls.Certificate{ccert},
+		CipherSuites:       []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+		InsecureSkipVerify: true,
+	}
+	serverPort := randomPort(t)
+	comm := newComm(ctx, ccfg, scfg, serverPort, server, client)
+	comm.assert(t)
+}
+
+func testPionE2ESimpleECDSAClientCert(t *testing.T, server, client func(*comm)) {
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	scert, err := selfsign.GenerateSelfSigned()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ccert, err := selfsign.GenerateSelfSigned()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scfg := &dtls.Config{
+		Certificates: []tls.Certificate{scert},
+		CipherSuites: []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+		ClientAuth:   dtls.RequireAnyClientCert,
+	}
+	ccfg := &dtls.Config{
+		Certificates:       []tls.Certificate{ccert},
+		CipherSuites:       []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+		InsecureSkipVerify: true,
+	}
+	serverPort := randomPort(t)
+	comm := newComm(ctx, ccfg, scfg, serverPort, server, client)
+	comm.assert(t)
+}
+
+func testPionE2ESimpleRSAClientCert(t *testing.T, server, client func(*comm)) {
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	spriv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scert, err := selfsign.SelfSign(spriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cpriv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ccert, err := selfsign.SelfSign(cpriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scfg := &dtls.Config{
+		Certificates: []tls.Certificate{scert},
+		CipherSuites: []dtls.CipherSuiteID{dtls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
+		ClientAuth:   dtls.RequireAnyClientCert,
+	}
+	ccfg := &dtls.Config{
+		Certificates:       []tls.Certificate{ccert},
+		CipherSuites:       []dtls.CipherSuiteID{dtls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
+		InsecureSkipVerify: true,
+	}
+	serverPort := randomPort(t)
+	comm := newComm(ctx, ccfg, scfg, serverPort, server, client)
+	comm.assert(t)
+}
+
 func TestPionE2ESimple(t *testing.T) {
 	testPionE2ESimple(t, serverPion, clientPion)
 }
@@ -326,4 +494,20 @@ func TestPionE2ESimplePSK(t *testing.T) {
 
 func TestPionE2EMTUs(t *testing.T) {
 	testPionE2EMTUs(t, serverPion, clientPion)
+}
+
+func TestPionE2ESimpleED25519(t *testing.T) {
+	testPionE2ESimpleED25519(t, serverPion, clientPion)
+}
+
+func TestPionE2ESimpleED25519ClientCert(t *testing.T) {
+	testPionE2ESimpleED25519ClientCert(t, serverPion, clientPion)
+}
+
+func TestPionE2ESimpleECDSAClientCert(t *testing.T) {
+	testPionE2ESimpleECDSAClientCert(t, serverPion, clientPion)
+}
+
+func TestPionE2ESimpleRSAClientCert(t *testing.T) {
+	testPionE2ESimpleRSAClientCert(t, serverPion, clientPion)
 }
