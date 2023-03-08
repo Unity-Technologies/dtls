@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -20,7 +21,7 @@ import (
 
 	"github.com/pion/dtls/v2"
 	"github.com/pion/dtls/v2/pkg/crypto/selfsign"
-	"github.com/pion/transport/test"
+	"github.com/pion/transport/v2/test"
 )
 
 const (
@@ -216,10 +217,10 @@ func serverPion(c *comm) {
 }
 
 /*
-  Simple DTLS Client/Server can communicate
-    - Assert that you can send messages both ways
-	- Assert that Close() on both ends work
-	- Assert that no Goroutines are leaked
+	  Simple DTLS Client/Server can communicate
+	    - Assert that you can send messages both ways
+		- Assert that Close() on both ends work
+		- Assert that no Goroutines are leaked
 */
 func testPionE2ESimple(t *testing.T, server, client func(*comm)) {
 	lim := test.TimeOut(time.Second * 30)
@@ -426,7 +427,15 @@ func testPionE2ESimpleECDSAClientCert(t *testing.T, server, client func(*comm)) 
 		t.Fatal(err)
 	}
 
+	clientCAs := x509.NewCertPool()
+	caCert, err := x509.ParseCertificate(ccert.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientCAs.AddCert(caCert)
+
 	scfg := &dtls.Config{
+		ClientCAs:    clientCAs,
 		Certificates: []tls.Certificate{scert},
 		CipherSuites: []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
 		ClientAuth:   dtls.RequireAnyClientCert,
