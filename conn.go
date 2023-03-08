@@ -28,7 +28,7 @@ const (
 	cookieLength          = 20
 	sessionLength         = 32
 	defaultNamedCurve     = elliptic.X25519
-	inboundBufferSize     = 8192
+	inboundBufferSize     = 2048
 	// Default replay protection window is specified by RFC 6347 Section 4.1.2.6
 	defaultReplayProtectionWindow = 64
 )
@@ -577,6 +577,7 @@ func (c *Conn) readAndBuffer(ctx context.Context) error {
 	defer poolReadBuffer.Put(bufptr)
 
 	b := *bufptr
+  b = b[128:]
 	i, err := c.nextConn.ReadContext(ctx, b)
 	if err != nil {
 		return netError(err)
