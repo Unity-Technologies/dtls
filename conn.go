@@ -577,7 +577,6 @@ func (c *Conn) readAndBuffer(ctx context.Context) error {
 	defer poolReadBuffer.Put(bufptr)
 
 	b := *bufptr
-  b = b[128:]
 	i, err := c.nextConn.ReadContext(ctx, b)
 	if err != nil {
 		return netError(err)
